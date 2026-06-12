@@ -1,8 +1,8 @@
 # Section 1 — ER Diagram
 
-The diagram below illustrates the comprehensive database schema designed for the TransitFlow system, capturing the relationships between all major entities.
+The diagram below illustrates the comprehensive database schema designed for the transit system, capturing the relationships between all major entities.
 
-![ER Diagram](https://i.meee.com.tw/YKl3F7g.jpg)
+<img src="ER-Diagram.jpg" alt="ER Diagram" width="750">
 
 
 # Section 2 — Normalisation Justification
