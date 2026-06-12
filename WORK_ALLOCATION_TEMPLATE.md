@@ -75,7 +75,7 @@ If nothing changed, write "No changes."
 
 | Change | Original plan | Revised plan | Reason |
 |--------|--------------|-------------|--------|
-| | | | |
+| No changes.| | | |
 
 ---
 
