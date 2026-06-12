@@ -493,3 +493,135 @@ However, after manually reviewing the schema, we discovered that these foreign k
 We corrected the design by adding the missing foreign key relationships and updating the ER diagram accordingly.
 
 This experience demonstrated the importance of verifying AI-generated suggestions against the actual implementation before accepting them.
+
+
+# Section 6 — Reflection & Trade-offs
+
+## 6.1 Overview
+
+TransitFlow adopts a polyglot persistence architecture. Instead of using one database for every task, the system separates different responsibilities across PostgreSQL, Neo4j, and pgvector. PostgreSQL is used for relational and transactional data, Neo4j is used for graph-based route search, and pgvector is used for semantic policy document search.
+
+This architecture gives the system more flexibility, because each database is used for the type of problem it handles best. However, it also introduces trade-offs in data consistency, system complexity, tool routing reliability, and maintenance cost. This section discusses the main design decisions and the trade-offs behind them.
+
+---
+
+## 6.2 Polyglot Persistence: PostgreSQL, Neo4j, and pgvector
+
+TransitFlow uses three data storage components with different responsibilities.
+
+| Component | Main Responsibility | Example Data / Function |
+|---|---|---|
+| PostgreSQL | Relational and transactional data | users, credentials, schedules, fares, bookings, payments, travel history |
+| Neo4j | Graph-based route search | fastest route, cheapest route, interchange paths, delay ripple analysis |
+| pgvector | Semantic policy search | refund rules, lost property, luggage rules, ticket rules, accessibility policies |
+
+This design allows each subsystem to focus on its strongest use case. PostgreSQL is suitable for structured data with primary keys, foreign keys, and transactions. Neo4j is suitable for station nodes and station-to-station relationships. pgvector is suitable for retrieving policy documents based on semantic similarity instead of exact keyword matching.
+
+The main trade-off is that these databases do not automatically stay synchronised. In the current implementation, PostgreSQL and Neo4j are seeded separately from the mock data files. Neo4j is not automatically updated when PostgreSQL changes. Therefore, the consistency between the relational data and graph data depends on using the same station identifiers and re-running the seed scripts when the underlying station data changes.
+
+For this project, the team chose this simpler approach instead of implementing a complex distributed transaction mechanism such as Two-Phase Commit. This is appropriate for the project scale because it keeps the system easier to understand, test, and maintain. In a production version, a stronger synchronisation mechanism would be needed, such as a central station-management service or an automatic graph update process whenever station or route data changes.
+
+---
+
+## 6.3 PostgreSQL as the Transaction Core
+
+PostgreSQL is used as the core database for transactional data. User profiles, login credentials, rail schedules, metro schedules, bookings, metro travel history, payments, and feedback are stored in PostgreSQL.
+
+This design is important because booking and payment operations require consistency. When a national rail booking is created, the system calculates the number of stops, calculates the fare, inserts a record into `national_rail_bookings`, and inserts a corresponding record into `payments`. These operations are handled within a PostgreSQL transaction. If an error occurs during the process, the transaction is rolled back.
+
+The benefit of this design is that it prevents partial writes. For example, the system should not create a payment without a booking, and it should not create a booking without a matching payment record. Keeping these write operations inside one PostgreSQL transaction improves reliability.
+
+The trade-off is that PostgreSQL is not the best tool for graph traversal and route search. Although route data can be represented in relational tables, complex path queries are easier to express in a graph database. Therefore, TransitFlow keeps PostgreSQL as the transaction core but uses Neo4j for route search.
+
+---
+
+## 6.4 Neo4j for Route Search
+
+Neo4j is used to represent the transport network as a graph. Metro stations are stored as `MetroStation` nodes, national rail stations are stored as `NationalRailStation` nodes, station-to-station movements are represented using `LINK_TO` relationships, and cross-network transfer points are represented using `INTERCHANGE_WITH` relationships.
+
+This graph structure supports several route-related functions:
+
+| Function | Purpose |
+|---|---|
+| `query_shortest_route()` | Finds the fastest route using `travel_time_min` as the weight |
+| `query_cheapest_route()` | Finds the lowest-cost route using fare-related relationship properties |
+| `query_interchange_path()` | Finds cross-network routes between Metro and National Rail |
+| `query_delay_ripple()` | Finds stations affected by a delay within a given number of hops |
+
+The main benefit of using Neo4j is that route search becomes natural and efficient. Dijkstra-based route search can directly use relationship weights such as `travel_time_min`, `standard_fare_usd`, or `first_fare_usd`.
+
+However, this also creates an important design boundary. Neo4j route cost is used for route comparison and recommendation, but it should not be treated as the only source of actual transaction pricing. The actual booking amount is still calculated and stored through the PostgreSQL booking flow. This separation prevents route recommendation logic from being confused with final payment logic.
+
+Therefore, the design trade-off is clear: Neo4j provides efficient graph search, while PostgreSQL remains responsible for the official transactional record.
+
+---
+
+## 6.5 pgvector for Policy Search
+
+TransitFlow uses pgvector to support semantic policy search. Policy documents are embedded into vectors and stored in the `policy_documents` table. When the user asks about refund rules, cancellation, delay compensation, lost property, ticket rules, luggage, accessibility, or other policy-related topics, the agent can search for relevant policy documents using vector similarity.
+
+The benefit of pgvector is that users do not need to use exact policy keywords. For example, a user may ask “I lost my wallet” instead of “lost property policy,” and the system can still retrieve relevant policy content.
+
+The trade-off is that semantic search can sometimes retrieve documents that are similar but not directly relevant. To reduce this risk, the agent includes deterministic fallback rules. These rules help route common policy questions to `search_policy` and reduce the chance that the LLM chooses an incorrect tool.
+
+This reflects a practical RAG design decision: vector search improves flexibility, but it still needs application-level routing rules and answer constraints to keep responses accurate.
+
+---
+
+## 6.6 LLM Agent Routing Reliability
+
+TransitFlow allows users to ask questions in natural language. The agent decides which tool to call based on the user’s message. For example, route questions should call `find_route`, payment questions should call `get_payment_info`, booking history questions should call `get_user_bookings`, and policy questions should call `search_policy`.
+
+This design makes the system more user-friendly because users do not need to manually select a database or form. However, it also introduces a reliability issue. A small LLM may sometimes choose the wrong tool, miss required parameters, or confuse different query types.
+
+To improve reliability, the implementation adds deterministic fallback rules after the LLM tool-selection step. These rules detect common patterns such as route queries, payment queries, booking requests, seat availability questions, and policy questions. If the LLM selects the wrong tool or fails to select one, the fallback rules can replace the tool call with a more appropriate one.
+
+The trade-off is that the agent becomes less purely LLM-driven, but more predictable and easier to test. For this project, this is a reasonable decision because live testing depends on stable tool selection and consistent database results.
+
+---
+
+## 6.7 Security Trade-off: Argon2 PasswordHasher
+
+TransitFlow does not store plaintext passwords. The authentication module uses Argon2 `PasswordHasher` to hash user passwords and security answers before storing them in `user_credentials`.
+
+During registration, the system hashes the password and the secret answer. During login, the system uses hash verification to check whether the entered password matches the stored hash. This design improves security because even if the database is exposed, the original password is not directly stored.
+
+The trade-off is performance. Password hashing is intentionally more expensive than a simple string comparison or a fast hash function. This increases login verification cost, but it also makes brute-force attacks more difficult. Since login is not the most frequent operation compared with route search or schedule lookup, the system prioritises password security over minimum login latency.
+
+The current implementation uses `PasswordHasher()` directly. Therefore, this document does not claim that the team manually configured specific Argon2 parameters such as `time_cost`, `memory_cost`, or `parallelism`. The accurate description is that the system uses Argon2 PasswordHasher for password and secret-answer hashing.
+
+---
+
+## 6.8 Transaction and Consistency Trade-off
+
+The system uses PostgreSQL transactions for booking and cancellation operations. In the booking process, the system writes both the booking record and the payment record within the same transaction. In the cancellation process, it updates the booking status and the related payment status.
+
+This provides strong consistency inside PostgreSQL. If one step fails, the system can roll back the transaction and avoid incomplete updates.
+
+However, this transaction does not cover Neo4j or pgvector. For example, booking a ticket does not update Neo4j, and updating a policy document does not affect route search. This is acceptable because each database serves a different purpose. PostgreSQL handles user and transaction data, Neo4j handles route topology, and pgvector handles policy retrieval.
+
+The trade-off is that the system avoids the complexity of distributed transactions. Instead, it keeps strong consistency where it matters most: booking, payment, cancellation, and user data. Cross-database consistency is handled through shared identifiers, seed scripts, and application-level logic.
+
+---
+
+## 6.9 Current Limitations
+
+The current architecture is suitable for a course project, but it has several limitations.
+
+First, PostgreSQL and Neo4j are not automatically synchronised. If station or route data changes, the graph database must be rebuilt or updated manually through the Neo4j seeding process.
+
+Second, Neo4j route cost is used for route comparison, but the actual payment amount should still be determined by PostgreSQL fare and booking logic. Developers must avoid mixing route-estimation cost with official booking payment.
+
+Third, pgvector search depends on the quality of policy documents and embeddings. If documents are too broad or too similar, search results may include less relevant policies. This is why deterministic routing and answer constraints are necessary.
+
+Fourth, LLM tool routing may still fail in unexpected phrasing. The fallback rules reduce this risk, but they do not eliminate it completely. More test cases would be needed for a production-level system.
+
+---
+
+## 6.10 Summary
+
+TransitFlow’s architecture balances correctness, flexibility, and implementation complexity. PostgreSQL is used as the transactional core for users, bookings, payments, and travel records. Neo4j is used for graph-based route search and interchange analysis. pgvector is used for semantic policy search. The LLM agent connects these components and routes natural language questions to the correct tool.
+
+The main trade-offs are cross-database consistency, LLM routing reliability, and security versus performance. The system avoids complex distributed transactions and instead uses PostgreSQL transactions for critical booking and payment operations. It uses Neo4j for route efficiency, pgvector for flexible policy search, and deterministic fallback rules to improve agent reliability.
+
+Overall, the design is appropriate for TransitFlow’s current project scale. It provides a clear separation of responsibilities, supports the required transport assistant functions, and leaves room for future production improvements such as automatic graph synchronisation, stronger policy retrieval filtering, and more comprehensive route validation.
