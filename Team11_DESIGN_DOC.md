@@ -109,7 +109,176 @@ The schema also uses foreign keys to maintain referential integrity for users, s
 
 Therefore, the TransitFlow relational design balances normalisation, data integrity, query efficiency, and practical transaction requirements.
 
+# Section 3 — Graph Database Design Rationale
 
+## 3.1 Nodes, Relationships, and Properties
+
+TransitFlow uses Neo4j to model the transportation network as a graph. The graph structure consists of nodes, relationships, and properties.
+
+### Nodes
+
+The system uses two node labels:
+
+* MetroStation
+* NationalRailStation
+
+Each node represents a physical transportation station within the network.
+
+Examples:
+
+text
+(MetroStation {station_id: "MS01"})
+(MetroStation {station_id: "MS02"})
+(NationalRailStation {station_id: "NR01"})
+
+Stations are modeled as nodes because they represent distinct locations that can be connected through routes and transfers.
+
+### Relationships
+
+TransitFlow uses two relationship types:
+
+#### LINK_TO
+
+Represents a direct connection between two stations.
+
+Example:
+
+text
+(MS01)-[:LINK_TO]->(MS02)
+
+#### INTERCHANGE_WITH
+
+Represents a transfer connection between the metro network and the national rail network.
+
+Example:
+
+text
+(MS05)-[:INTERCHANGE_WITH]->(NR01)
+
+The relationship is created in both directions to support bidirectional transfers.
+
+### Properties
+
+Node properties store station information:
+
+text
+station_id
+name
+lines
+
+Relationship properties store routing information:
+
+text
+travel_time_min
+cost_usd
+standard_fare_usd
+first_fare_usd
+transfer_time_min
+
+For example:
+
+text
+(MS01)-[:LINK_TO {
+    travel_time_min: 5,
+    cost_usd: 0.30
+}]->(MS02)
+
+These properties allow routing algorithms to calculate travel time, ticket cost, and transfer penalties directly from the graph.
+
+---
+
+## 3.2 Why a Graph Database Instead of a Relational Database
+
+TransitFlow uses a graph database because route planning and network traversal are naturally graph problems.
+
+In Neo4j, stations are modeled as nodes and connections are modeled as relationships. This structure allows graph algorithms such as Dijkstra's algorithm to operate directly on the transportation network.
+
+For example, finding the shortest route between two stations involves traversing connected nodes while minimizing the accumulated travel time stored in the relationship properties.
+
+In a relational database, the same operation would require recursive Common Table Expressions (Recursive CTEs) and repeated joins across station and link tables.
+
+Example:
+
+sql
+WITH RECURSIVE ...
+
+As the transportation network grows, recursive joins become increasingly complex and difficult to maintain.
+
+By contrast, graph databases are specifically optimized for traversal-based queries. Algorithms such as Dijkstra can efficiently explore connected paths without repeatedly joining multiple tables.
+
+Therefore, Neo4j provides a more natural and scalable solution for routing and path-finding operations within TransitFlow.
+
+---
+
+## 3.3 Query Type 1: Shortest Path Search
+
+One important graph query in TransitFlow is shortest-path routing.
+
+Example:
+
+text
+Origin: MS01
+Destination: NR05
+
+The system searches through LINK_TO and INTERCHANGE_WITH relationships and calculates the total travel time using the travel_time_min property.
+
+The graph model makes this query straightforward because stations are already connected through explicit relationships.
+
+A shortest-path algorithm such as Dijkstra can traverse the graph and identify the route with the minimum total travel time.
+
+This type of query would be significantly more complex in a relational database because the system would need recursive joins to discover possible routes.
+
+---
+
+## 3.4 Query Type 2: Interchange Route Search
+
+A second important query type is interchange routing.
+
+Example:
+
+text
+Find a route from a metro station to a national rail station with the fewest transfers.
+
+This query relies on the INTERCHANGE_WITH relationships that connect the two transportation networks.
+
+Because transfer connections are explicitly represented in the graph, Neo4j can efficiently identify routes that minimize the number of interchanges.
+
+The graph structure makes it easy to explore alternative paths and compare transfer counts.
+
+This is particularly useful when users prefer fewer transfers even if the overall travel time is slightly longer.
+
+---
+
+## 3.5 Node Identity
+
+The unique identifier for all station nodes is:
+
+text
+station_id
+
+Examples:
+
+text
+MS01
+MS02
+NR01
+NR05
+
+The station_id property is used because it is guaranteed to be unique within the transportation network.
+
+Station names are not used as identifiers because multiple stations could potentially share similar names or naming conventions.
+
+Using station_id ensures consistency across both PostgreSQL and Neo4j and allows reliable node matching during graph construction and query execution.
+
+---
+
+## 3.6 Summary
+
+TransitFlow models transportation infrastructure using Neo4j nodes, relationships, and properties. Stations are represented as nodes, route connections are represented as relationships, and routing metrics such as travel time and cost are stored as properties.
+
+Compared with a relational database, the graph model provides a more natural representation of transportation networks and supports efficient traversal algorithms such as Dijkstra's algorithm.
+
+This design enables important routing functions such as shortest-path search and interchange routing while maintaining scalability as the transportation network grows.
 
 # Section 4 — Vector / RAG Design
 
