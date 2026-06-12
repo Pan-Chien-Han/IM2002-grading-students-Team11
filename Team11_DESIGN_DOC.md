@@ -632,3 +632,398 @@ TransitFlow’s architecture balances correctness, flexibility, and implementati
 The main trade-offs are cross-database consistency, LLM routing reliability, and security versus performance. The system avoids complex distributed transactions and instead uses PostgreSQL transactions for critical booking and payment operations. It uses Neo4j for route efficiency, pgvector for flexible policy search, and deterministic fallback rules to improve agent reliability.
 
 Overall, the design is appropriate for TransitFlow’s current project scale. It provides a clear separation of responsibilities, supports the required transport assistant functions, and leaves room for future production improvements such as automatic graph synchronisation, stronger policy retrieval filtering, and more comprehensive route validation.
+
+
+## Section 7 — Extension Design: Policy RAG, Connection Pooling, and End-to-End Production-Oriented Optimization
+
+### 7.1 Extension Goal
+
+This extension aims to enhance TransitFlow from a basic transit assistant for route search, fare lookup, booking, and cancellation into a more realistic customer-service-oriented transit assistant. The added features focus on policy-related questions that commonly appear in real transit systems, including:
+
+1. Severe weather and typhoon disruption policies
+2. Refund rules when services are cancelled by the operator due to severe weather, natural disasters, or strikes
+3. Infant facilities and baby care support
+4. Baby changing facilities and diaper-changing support
+5. Breastfeeding policy
+6. Priority seating, accessibility, and support for passengers travelling with young children
+
+These features are not structured schedule, fare, or booking records. Instead, they are text-based policy knowledge. Therefore, the extension is implemented through the existing pgvector / RAG policy document pipeline rather than by creating new relational tables.
+
+The key goal is to ensure that these new policies are not answered directly from the LLM's general knowledge. Instead, the user query should go through the complete TransitFlow pipeline:
+
+```text
+UI → agent → tool calling → DB → agent & LLM → UI
+```
+
+This confirms that the final response is grounded in TransitFlow's own database content.
+
+---
+
+### 7.1.1 Extension Scope: Policy-Document-Level Extension
+
+This extension is a **policy-document-level extension**, not a **relational-schema-level extension**.
+
+The new severe weather, typhoon, baby changing, infant facilities, and breastfeeding features are stored as policy documents in JSON files and embedded into the `policy_documents` vector table. They do not require new PostgreSQL relational tables because they are not transactional records or structured operational data.
+
+The implemented flow is:
+
+```text
+policy JSON files → seed_vectors.py → policy_documents / pgvector → search_policy → agent & LLM → UI
+```
+
+It is not this flow:
+
+```text
+schema.sql → seed_postgres.py → relational table → relational query function
+```
+
+This design follows the intended role of the vector database in TransitFlow: policy documents such as refunds, conduct, travel rules, accessibility, and customer service rules are retrieved through pgvector similarity search. For this reason, the extension can be completed without modifying `schema.sql` or creating additional relational tables.
+
+---
+
+### 7.2 Added Policy Documents
+
+The extension adds or enriches policy data in the JSON policy files under `train-mock-data/`. These JSON files are later processed by `seed_vectors.py`, embedded by the configured LLM embedding provider, and stored in PostgreSQL's `policy_documents` table.
+
+#### 7.2.1 Severe Weather / Typhoon / Service Cancellation Policy
+
+The severe weather extension supports questions such as:
+
+```text
+What is the policy if service is cancelled because of severe weather?
+What happens if there is a typhoon?
+Can tickets be refunded if the service is suspended due to weather?
+```
+
+The relevant policy document is:
+
+```text
+Force Majeure and Severe Weather Disruption
+```
+
+This document states that if a train or metro service is officially cancelled by the operator due to severe weather, natural disasters, or strikes, passengers are entitled to a full 100% refund with no administrative fee.
+
+This allows TransitFlow to answer questions about typhoon disruption, weather-related suspension, natural disasters, strikes, and operator-cancelled services.
+
+#### 7.2.2 Infant Facilities / Baby Changing / Breastfeeding Policy
+
+The infant facilities extension supports questions such as:
+
+```text
+Do you have baby changing facilities?
+Can passengers breastfeed on the train?
+Is there a baby room or diaper desk at the station?
+```
+
+The relevant policy documents include:
+
+```text
+Travel Policy — National Rail — Infant Facilities
+Travel Policy — Metro — Infant Facilities
+```
+
+For National Rail, the policy states that baby changing is available at all National Rail stations within accessible restroom facilities. Breastfeeding is permitted in passenger lounges and coaches, and complimentary hot water for baby formula can be requested at the central station counter.
+
+For Metro, the policy states that baby changing is available at major interchange stations such as MS01, MS05, and MS10. Passengers are also welcome to breastfeed anywhere on station premises or onboard metro carriages.
+
+---
+
+### 7.3 pgvector Seeding Flow
+
+The new policy data is loaded through `seed_vectors.py`. The seeding process works as follows:
+
+1. Load policy JSON files from `train-mock-data/`.
+2. Split refund policies, ticket types, booking rules, and travel policies into separate policy documents.
+3. Convert each policy document into text content.
+4. Generate an embedding for each document using the configured LLM embedding provider.
+5. Store the document title, category, content, embedding, and source file into PostgreSQL's `policy_documents` table.
+6. Use pgvector similarity search to retrieve the most relevant documents during user queries.
+
+Splitting the travel policies by network and topic is important because it prevents unrelated policy sections from being stored as one large document. For example, infant facilities are stored separately from bicycles, luggage, pets, and smoking rules. This improves retrieval accuracy when the user asks about baby changing, breastfeeding, or infant support.
+
+---
+
+### 7.4 Agent Tool Registration and Routing
+
+No new UI was required for this extension. The existing Gradio chat interface continues to receive user input and display responses. The extension is connected through the agent's existing tool-calling mechanism.
+
+In `skeleton/agent.py`, `search_policy` is registered as a tool that the LLM can call. Its description includes policy topics such as:
+
+```text
+refunds, cancellations, delay compensation, severe weather, strikes,
+service cancellations, luggage, bicycles, pets, food and drink,
+priority seating, accessibility, wheelchair access, assisted boarding,
+quiet zones, infant facilities, baby changing, breastfeeding
+```
+
+Therefore, when the user asks about severe weather, typhoons, service cancellations, baby changing, breastfeeding, or infant facilities, the agent can route the query to:
+
+```python
+search_policy(query)
+```
+
+Inside `_execute_tool()`, the `search_policy` branch performs the following logic:
+
+```python
+embedding = llm.embed(params["query"])
+docs = query_policy_vector_search(embedding)
+```
+
+This means the answer is not hard-coded in the agent. The agent first embeds the user query, retrieves relevant documents from pgvector, and then passes the database result to the LLM for final response generation.
+
+---
+
+### 7.5 End-to-End Flow
+
+This extension satisfies the required end-to-end flow:
+
+```text
+UI → agent → tool calling → DB → agent & LLM → UI
+```
+
+The severe weather policy query is an example.
+
+#### Step 1 — UI
+
+The user enters a natural language question in the Gradio UI:
+
+```text
+What is the policy if service is cancelled because of severe weather?
+```
+
+#### Step 2 — Agent
+
+`run_agent()` receives the user message. The agent determines that this is a policy-related question because it contains concepts such as service cancellation and severe weather.
+
+The agent selects the policy search tool:
+
+```text
+search_policy
+```
+
+#### Step 3 — Tool Calling
+
+The agent calls:
+
+```python
+search_policy({"query": "policy regarding cancellations due to severe weather"})
+```
+
+#### Step 4 — Database Retrieval
+
+The tool embeds the query using `llm.embed()` and then calls:
+
+```python
+query_policy_vector_search(embedding)
+```
+
+PostgreSQL / pgvector searches the `policy_documents` table and retrieves the most relevant policy document, such as:
+
+```text
+Force Majeure and Severe Weather Disruption
+```
+
+This document contains the actual database-grounded rule: if the service is officially cancelled due to severe weather, natural disasters, or strikes, passengers are entitled to a 100% refund with no administrative fee.
+
+#### Step 5 — Agent & LLM
+
+The agent normalises the raw JSON database result into readable text and places it inside:
+
+```text
+DATA FROM TRANSITFLOW DATABASE
+```
+
+The LLM is then instructed to answer using only this retrieved database content.
+
+#### Step 6 — UI
+
+The final answer is returned to the Gradio UI. The user sees a natural language response based on the retrieved TransitFlow policy document.
+
+Therefore, the severe weather feature is not simply generated by the LLM. It goes through:
+
+```text
+UI → agent → search_policy → pgvector DB → policy document result → LLM → UI
+```
+
+---
+
+### 7.6 Infant Facilities End-to-End Example
+
+The infant facilities feature follows the same pipeline.
+
+The user enters:
+
+```text
+Do you have baby changing facilities?
+```
+
+The agent identifies this as a policy question and calls:
+
+```python
+search_policy({"query": "baby changing facilities"})
+```
+
+pgvector retrieves relevant policy documents, such as:
+
+```text
+Travel Policy — National Rail — Infant Facilities
+Travel Policy — Metro — Infant Facilities
+```
+
+The retrieved documents contain the actual facility rules:
+
+```text
+National Rail: Baby changing is available at all National Rail stations within accessible restroom facilities.
+Metro: Baby changing is available at major Metro interchange stations such as MS01, MS05, and MS10.
+```
+
+The LLM then formats this database result into a user-friendly response and returns it to the UI.
+
+Another example is:
+
+```text
+Can passengers breastfeed on the train?
+```
+
+The same `search_policy` tool is called, and the retrieved infant facilities documents allow the LLM to answer that breastfeeding is permitted in passenger lounges, coaches, station premises, or onboard metro carriages, depending on the network.
+
+This verifies that the baby changing and breastfeeding features are not just static text. They are retrieved from the vector database through the agent's tool-calling pipeline.
+
+---
+
+### 7.7 Debug Panel Evidence
+
+The system's debug panel was used to verify the end-to-end execution. The debug panel displays:
+
+1. Tool selection
+2. Called tool name and parameters
+3. Raw database result
+4. Summary sent to the LLM
+5. Normalised database data
+
+The following test questions were used:
+
+```text
+What is the policy if service is cancelled because of severe weather?
+What happens if there is a typhoon?
+Do you have baby changing facilities?
+Can passengers breastfeed on the train?
+Is there a baby room or diaper desk at the station?
+```
+
+For these tests, the debug panel showed:
+
+```text
+Calling: search_policy(...)
+Result raw: [...]
+Data normalised: [search_policy]
+```
+
+This confirms that the policy extension is actually retrieved from the database before the final LLM response is generated.
+
+---
+
+### 7.8 Connection Pooling and Production-Oriented Optimization
+
+In addition to the policy RAG extension, the Neo4j graph query layer includes a production-style connection pool.
+
+In `databases/graph/queries.py`, the system creates a global Neo4j driver:
+
+```python
+_PROD_DRIVER = GraphDatabase.driver(
+    NEO4J_URI,
+    auth=(NEO4J_USER, NEO4J_PASSWORD),
+    max_connection_pool_size=50
+)
+```
+
+Graph query functions such as shortest route, cheapest route, interchange path, alternative route, and delay ripple analysis reuse this global driver. This avoids creating a new Neo4j driver for every query and improves efficiency for repeated route-related requests.
+
+This optimisation supports:
+
+1. Fastest route search
+2. Cheapest route search
+3. Cross-network interchange path
+4. Alternative route avoiding a station
+5. Delay ripple analysis
+
+Although the severe weather and infant facilities extension mainly uses PostgreSQL / pgvector, the overall system also benefits from the Neo4j connection pool for route-related tools.
+
+---
+
+### 7.9 I/O Layering and Future Async Compatibility
+
+This extension does not modify `skeleton/ui.py`. The UI remains the existing Gradio chat interface. This is appropriate because UI customisation is optional, and the extension can be completed through the agent and policy database layers.
+
+The system is designed in layers:
+
+```text
+UI layer: Gradio chat input/output
+Agent layer: tool selection and orchestration
+Tool layer: search_policy / find_route / booking tools
+Database layer: PostgreSQL / pgvector / Neo4j
+LLM layer: final answer generation
+```
+
+Currently, most database operations are synchronous. However, the query logic is already isolated inside tool functions. This makes future asynchronous I/O easier to add because the database access layer can be replaced without redesigning the UI or agent logic.
+
+Possible future improvements include:
+
+1. Replacing PostgreSQL connections with a connection pool.
+2. Using an async database driver such as `asyncpg`.
+3. Making tool execution asynchronous.
+4. Using Gradio queue or background execution for longer-running requests.
+
+This document does not claim that a full async database implementation has already been completed. Instead, the current design provides a clean layered structure that can support async I/O in future improvements.
+
+---
+
+### 7.10 Test Cases and Results
+
+| Test Question | Expected Tool | Retrieved Policy | End-to-End Result |
+|---|---|---|---|
+| What is the policy if service is cancelled because of severe weather? | `search_policy` | Force Majeure and Severe Weather Disruption | Successfully returns 100% refund and no admin fee |
+| What happens if there is a typhoon? | `search_policy` | Force Majeure / Severe Weather policy | Successfully returns typhoon or severe weather cancellation policy |
+| Do you have baby changing facilities? | `search_policy` | National Rail / Metro Infant Facilities | Successfully returns baby changing locations |
+| Can passengers breastfeed on the train? | `search_policy` | Infant Facilities | Successfully returns breastfeeding policy |
+| Is there a baby room or diaper desk at the station? | `search_policy` | Infant Facilities | Successfully returns baby changing / diaper facility information |
+
+These tests demonstrate that the extension is database-grounded and works through the full agent tool-calling pipeline.
+
+---
+
+### 7.11 Limitations and Future Improvements
+
+The policy search currently relies on embedding similarity. If a user query contains multiple policy concepts, such as typhoon, refund, and ticket change, the retrieval result may sometimes rank a related but less precise document higher than the ideal severe weather policy.
+
+For example:
+
+```text
+Can tickets be refunded if the service is suspended because of a typhoon?
+```
+
+This query may contain both ticket and refund terms, so pgvector may retrieve a ticket-change policy instead of the severe weather refund policy. This is not a failure of the end-to-end pipeline. It is a retrieval-ranking limitation.
+
+Future improvements include:
+
+1. Adding more synonyms to the severe weather policy document, such as `typhoon refund`, `weather suspension`, `service suspended due to typhoon`, and `natural disaster refund`.
+2. Adding more specific categories such as `service_disruption`, `weather_refund`, and `infant_facilities`.
+3. Adding a routing rule that prioritises severe weather policy when a query contains both weather-related and refund-related terms.
+4. Splitting policy documents into even smaller topic-based chunks.
+
+
+---
+
+### 7.12 Summary
+
+This extension adds severe weather / typhoon disruption policy and infant facilities / baby changing / breastfeeding policy to TransitFlow. These features are implemented as a policy-document-level RAG extension rather than a relational-schema-level extension.
+
+The new JSON policy data is embedded and stored in PostgreSQL / pgvector through `seed_vectors.py`. The existing `search_policy` tool retrieves relevant policy documents based on the user's natural language query. The agent then passes the retrieved database result to the LLM, and the final answer is shown in the Gradio UI.
+
+The completed flow is:
+
+```text
+UI → agent → tool calling → DB → agent & LLM → UI
+```
+
+This demonstrates that the extension is not only a JSON data addition but a working end-to-end policy retrieval feature integrated into the TransitFlow assistant.
