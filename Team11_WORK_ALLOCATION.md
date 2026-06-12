@@ -49,7 +49,7 @@ or reassigned mid-project).
 | Section 4 — Vector / RAG Design | 羅妍安| | |
 | Section 5 — AI Tool Usage Evidence | 羅妍安 | | |
 | Section 6 — Reflection & Trade-offs | 王文岑 | | |
-| Section 7 — Optional Extension *(if applicable)* | | | |
+| Section 7 — Optional Extension *(if applicable)* | 王文岑 | | |
 
 ---
 
